@@ -2,19 +2,20 @@
  * Regression tests for issue #2562: dead tmux sessions must not emit
  * pane-derived keyword/stale alerts after cleanup.
  *
- * When `isPaneAlive(paneId)` returns false (pane_dead=1 or session gone),
- * wakeOpenClaw must skip capturePaneContent entirely so stale scrollback
- * from a cleaned-up session never reaches the OpenClaw gateway as tmuxTail.
+ * The fix uses getNewPaneTail (delta-capture) from pane-fresh-capture.js:
+ * only new lines since the last snapshot are forwarded. A dead or idle pane
+ * returns an empty string, so no stale scrollback ever reaches the gateway
+ * as tmuxTail.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { join } from "path";
 
-// Hoisted mocks for functions that will be called via dynamic import inside wakeOpenClaw.
-const mockIsPaneAlive = vi.fn<(paneId: string) => boolean>();
-const mockCapturePaneContent = vi.fn<(paneId: string, lines?: number) => string>();
+// Hoisted mock for the delta-capture function used inside wakeOpenClaw.
+const mockGetNewPaneTail = vi.fn<(paneId: string, stateDir: string, maxLines?: number) => string>(() => "");
 
-vi.mock("../../features/rate-limit-wait/tmux-detector.js", () => ({
-  isPaneAlive: (paneId: string) => mockIsPaneAlive(paneId),
-  capturePaneContent: (paneId: string, lines?: number) => mockCapturePaneContent(paneId, lines),
+vi.mock("../../features/rate-limit-wait/pane-fresh-capture.js", () => ({
+  getNewPaneTail: (paneId: string, stateDir: string, maxLines?: number) =>
+    mockGetNewPaneTail(paneId, stateDir, maxLines),
 }));
 
 vi.mock("../../notifications/tmux.js", () => ({
@@ -73,6 +74,9 @@ const RESOLVED_GW = {
   instruction: "Stopped: {{tmuxTail}}",
 };
 
+const PROJECT_PATH = "/home/user/project";
+const STATE_DIR = join(PROJECT_PATH, ".omc", "state");
+
 describe("dead-pane guard in wakeOpenClaw (issue #2562)", () => {
   let origTmux: string | undefined;
   let origTmuxPane: string | undefined;
@@ -85,8 +89,8 @@ describe("dead-pane guard in wakeOpenClaw (issue #2562)", () => {
 
     vi.mocked(getOpenClawConfig).mockReturnValue(TEST_CONFIG);
     vi.mocked(resolveGateway).mockReturnValue(RESOLVED_GW);
-    mockIsPaneAlive.mockReset();
-    mockCapturePaneContent.mockReset();
+    mockGetNewPaneTail.mockReset();
+    mockGetNewPaneTail.mockReturnValue("");
     vi.mocked(wakeGateway).mockReset();
     vi.mocked(wakeGateway).mockResolvedValue({ gateway: "test-gw", success: true });
   });
@@ -99,97 +103,97 @@ describe("dead-pane guard in wakeOpenClaw (issue #2562)", () => {
     vi.clearAllMocks();
   });
 
-  it("skips capture when pane is dead — no stale tmuxTail in payload", async () => {
-    mockIsPaneAlive.mockReturnValue(false);
+  it("skips capture when pane has no new lines — no stale tmuxTail in payload", async () => {
+    mockGetNewPaneTail.mockReturnValue("");
 
     await wakeOpenClaw("stop", {
       sessionId: "sid-dead",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).toHaveBeenCalledWith("%42");
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).toHaveBeenCalledWith("%42", STATE_DIR, 15);
     const [, , payload] = vi.mocked(wakeGateway).mock.calls[0] as [string, unknown, { tmuxTail?: string }];
     expect(payload.tmuxTail).toBeUndefined();
   });
 
-  it("captures content when pane is alive — tmuxTail forwarded to gateway", async () => {
-    mockIsPaneAlive.mockReturnValue(true);
-    mockCapturePaneContent.mockReturnValue("live output line");
+  it("captures new pane delta — tmuxTail forwarded to gateway", async () => {
+    mockGetNewPaneTail.mockReturnValue("live output line");
 
     await wakeOpenClaw("stop", {
       sessionId: "sid-alive",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).toHaveBeenCalledWith("%42");
-    expect(mockCapturePaneContent).toHaveBeenCalledWith("%42", 15);
+    expect(mockGetNewPaneTail).toHaveBeenCalledWith("%42", STATE_DIR, 15);
     const [, , payload] = vi.mocked(wakeGateway).mock.calls[0] as [string, unknown, { tmuxTail?: string }];
     expect(payload.tmuxTail).toBe("live output line");
   });
 
-  it("skips capture for session-end when pane is dead", async () => {
-    mockIsPaneAlive.mockReturnValue(false);
+  it("skips capture for session-end when pane has no new lines", async () => {
+    mockGetNewPaneTail.mockReturnValue("");
     vi.mocked(resolveGateway).mockReturnValue({ ...RESOLVED_GW, instruction: "Ended: {{tmuxTail}}" });
 
     await wakeOpenClaw("session-end", {
       sessionId: "sid-end-dead",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).toHaveBeenCalledWith("%42");
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).toHaveBeenCalledWith("%42", STATE_DIR, 15);
+    const [, , payload] = vi.mocked(wakeGateway).mock.calls[0] as [string, unknown, { tmuxTail?: string }];
+    expect(payload.tmuxTail).toBeUndefined();
   });
 
-  it("does not call isPaneAlive for session-start (non-stop event)", async () => {
+  it("does not call getNewPaneTail for session-start (non-stop event)", async () => {
     vi.mocked(resolveGateway).mockReturnValue({ ...RESOLVED_GW, instruction: "Started" });
 
     await wakeOpenClaw("session-start", {
       sessionId: "sid-start",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).not.toHaveBeenCalled();
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).not.toHaveBeenCalled();
   });
 
-  it("does not call isPaneAlive when TMUX env is absent", async () => {
+  it("does not call getNewPaneTail when TMUX env is absent", async () => {
     delete process.env.TMUX;
-    mockIsPaneAlive.mockReturnValue(true);
 
     await wakeOpenClaw("stop", {
       sessionId: "sid-no-tmux",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).not.toHaveBeenCalled();
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).not.toHaveBeenCalled();
   });
 
-  it("does not call isPaneAlive when TMUX_PANE env is absent", async () => {
+  it("does not call getNewPaneTail when TMUX_PANE env is absent", async () => {
     delete process.env.TMUX_PANE;
-    mockIsPaneAlive.mockReturnValue(true);
 
     await wakeOpenClaw("stop", {
       sessionId: "sid-no-pane-id",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
     });
 
-    expect(mockIsPaneAlive).not.toHaveBeenCalled();
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).not.toHaveBeenCalled();
   });
 
-  it("uses caller-provided tmuxTail and skips isPaneAlive entirely", async () => {
-    mockIsPaneAlive.mockReturnValue(true);
+  it("does not call getNewPaneTail when projectPath is absent", async () => {
+    await wakeOpenClaw("stop", {
+      sessionId: "sid-no-path",
+    });
 
+    expect(mockGetNewPaneTail).not.toHaveBeenCalled();
+    const [, , payload] = vi.mocked(wakeGateway).mock.calls[0] as [string, unknown, { tmuxTail?: string }];
+    expect(payload.tmuxTail).toBeUndefined();
+  });
+
+  it("uses caller-provided tmuxTail and skips getNewPaneTail entirely", async () => {
     await wakeOpenClaw("stop", {
       sessionId: "sid-prefilled",
-      projectPath: "/home/user/project",
+      projectPath: PROJECT_PATH,
       tmuxTail: "pre-captured content",
     });
 
-    expect(mockIsPaneAlive).not.toHaveBeenCalled();
-    expect(mockCapturePaneContent).not.toHaveBeenCalled();
+    expect(mockGetNewPaneTail).not.toHaveBeenCalled();
     const [, , payload] = vi.mocked(wakeGateway).mock.calls[0] as [string, unknown, { tmuxTail?: string }];
     expect(payload.tmuxTail).toBe("pre-captured content");
   });
